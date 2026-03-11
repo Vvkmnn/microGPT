@@ -1,6 +1,6 @@
-![demo](demo.gif)
-
 # microGPT (demo)
+
+![demo](demo.gif)
 
 An interactive terminal presentation that builds, trains, and runs a character-level language model on 32,000 real names, step by step. Every number you see is computed live.
 
