@@ -24,9 +24,9 @@ from rich.columns import Columns
 from rich.syntax import Syntax
 from rich import box
 
-# ---------------------------------------------------------------------------
+# ---
 # microGPT engine — Karpathy's code restructured into callable functions
-# ---------------------------------------------------------------------------
+# ---
 
 class Value:
     __slots__ = ('data', 'grad', '_children', '_local_grads')
@@ -360,18 +360,24 @@ def forward_stages(token_id, pos_id, sd):
     x = [a + b for a, b in zip(fc2, after_attn)]
     after_mlp = list(x)
 
+    # Output projection: lm_head @ after_mlp -> logits (vocab_size-dim)
+    logits = lin(after_mlp, sd['lm_head'])
+    probs = softmax_data(logits)
+
     return [
         ('Token Embedding', tok_emb),
         ('Position Embedding', pos_emb),
         ('RMSNorm', after_norm),
         ('Attention', after_attn),
         ('MLP', after_mlp),
+        ('Output (logits)', logits),
+        ('Softmax', probs),
     ]
 
 
-# ---------------------------------------------------------------------------
+# ---
 # TUI helpers
-# ---------------------------------------------------------------------------
+# ---
 
 SPARK = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
 
@@ -449,9 +455,9 @@ def build_tree(count):
     return tree
 
 
-# ---------------------------------------------------------------------------
+# ---
 # TUI — Screens and App
-# ---------------------------------------------------------------------------
+# ---
 
 APP_CSS = """
 Screen {
@@ -577,9 +583,9 @@ class TrainDone(Message):
         self.elapsed = elapsed
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Base screen with shared navigation and timer management
-# ---------------------------------------------------------------------------
+# ---
 class DemoScreen(Screen):
     """Base screen with common key handling and timer management."""
 
@@ -765,9 +771,9 @@ class DemoScreen(Screen):
         pass
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Screen 0: Data — Cascading Name Grid
-# ---------------------------------------------------------------------------
+# ---
 class DataScreen(DemoScreen):
     SCREEN_INDEX = 1
     SCREEN_TITLE = "The Data"
@@ -785,7 +791,7 @@ class DataScreen(DemoScreen):
         self._all_names = docs
         self._revealed = 0
         # How many names to show per tick (fast cascade)
-        self._names_per_tick = max(1, len(docs) // 80)
+        self._names_per_tick = max(1, len(docs) // 30)
         self._render_names()
         self._render_explanation()
         self._add_timer(self.set_interval(0.04, self._cascade_tick))
@@ -917,9 +923,9 @@ class DataScreen(DemoScreen):
         self._add_timer(self.set_interval(0.04, self._cascade_tick))
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Screen 1: Title — Progressive Tree Reveal + Counting Config
-# ---------------------------------------------------------------------------
+# ---
 class TitleScreen(DemoScreen):
     SCREEN_INDEX = 0
     SCREEN_TITLE = "microGPT"
@@ -1003,9 +1009,9 @@ class TitleScreen(DemoScreen):
         return "                                                              Enter begin  ? help"
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Screen 1: Tokenization — Animated Character-by-Character + Auto-Cycle
-# ---------------------------------------------------------------------------
+# ---
 class TokenizationScreen(DemoScreen):
     SCREEN_INDEX = 2
     SCREEN_TITLE = "Step 1: Tokenization"
@@ -1122,9 +1128,9 @@ class TokenizationScreen(DemoScreen):
         self._start_animation()
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Screen 2: Prediction (2 phases) — Animated Bars + Pipeline
-# ---------------------------------------------------------------------------
+# ---
 class PredictionScreen(DemoScreen):
     SCREEN_INDEX = 3
     max_phase = 2
@@ -1318,11 +1324,13 @@ class PredictionScreen(DemoScreen):
     def _animate_pipeline(self):
         if self._stage_idx >= len(self._stages):
             self._stop_all_timers()
+            self._render_pipeline()
             self._add_timer(self.set_timer(3.0, self._restart_phase_b))
             return
-        if self._bar_fill <= N_EMBD:
+        stage_len = len(self._stages[self._stage_idx][1])
+        if self._bar_fill <= stage_len:
             self._render_pipeline()
-            self._bar_fill += 1
+            self._bar_fill += 3
         else:
             self._stage_idx += 1
             self._bar_fill = 0
@@ -1335,58 +1343,80 @@ class PredictionScreen(DemoScreen):
     def _render_pipeline(self):
         data_text = Text()
         ch = self._stage_char
-        data_text.append(f'  Forward pass: "{ch}" at pos {self._stage_pos}\n\n')
+        docs, uchars, BOS, vocab_size = self.app.data
+        data_text.append(f'  Input: "{ch}" at pos {self._stage_pos}\n\n')
 
-        # Double-width sparkline for visibility
-        def wide_sparkline(vec, fill=None):
-            if fill is not None:
-                vec = vec[:fill]
+        # Fixed-width sparkline: always N_EMBD display bars, downsampling longer vectors
+        display_w = N_EMBD
+
+        def wide_sparkline(vec, fill_frac=None):
+            """Render vec as display_w double-width spark chars. fill_frac 0..1 controls partial reveal."""
             if not vec:
-                return ""
-            mn, mx = min(vec), max(vec)
+                return "", 0
+            # Downsample to display_w bins
+            n = len(vec)
+            bins = []
+            for b in range(display_w):
+                lo = b * n // display_w
+                hi = (b + 1) * n // display_w
+                if hi <= lo:
+                    hi = lo + 1
+                bins.append(sum(vec[lo:hi]) / (hi - lo))
+            mn, mx = min(bins), max(bins)
             if mx == mn:
                 mx = mn + 1
-            return "".join(
+            filled = display_w if fill_frac is None else int(fill_frac * display_w)
+            filled = max(0, min(display_w, filled))
+            chars = "".join(
                 SPARK[min(7, int((v - mn) / (mx - mn) * 7))] * 2
-                for v in vec
+                for v in bins[:filled]
             )
+            padding = "··" * (display_w - filled)
+            return chars + padding, filled
 
+        last = len(self._stages) - 1
         for i, (label, vec) in enumerate(self._stages):
+            n = len(vec)
+            connector = " +" if label == 'Token Embedding' else " \u21b4"
             if i > self._stage_idx:
                 data_text.append(f"  {label}\n", style="dim")
-                data_text.append(f"   {'··' * N_EMBD}\n", style="dim")
+                data_text.append(f"   {'··' * display_w}", style="dim")
+                if i <= last:
+                    data_text.append(connector, style="dim")
+                data_text.append("\n\n")
             elif i == self._stage_idx:
                 data_text.append(f"  {label}\n", style="bold bright_cyan")
-                fill = min(self._bar_fill, len(vec))
-                if fill > 0:
-                    bars = wide_sparkline(vec, fill)
-                    padding = "··" * (N_EMBD - fill)
-                    data_text.append(f"   {bars}{padding}\n", style="bright_cyan")
-                else:
-                    data_text.append(f"   {'··' * N_EMBD}\n", style="dim")
-                # Show numeric values for filled portion
-                shown = vec[:min(4, fill)]
+                fill_frac = self._bar_fill / n if n > 0 else 0
+                bars, filled = wide_sparkline(vec, fill_frac)
+                data_text.append(f"   {bars}", style="bright_cyan")
+                if i <= last:
+                    data_text.append(connector, style="dim")
+                data_text.append("\n")
+                # Show numeric values for active stage
+                shown = vec[:min(4, self._bar_fill)]
                 if shown:
                     vals_str = "   [" + ", ".join(f"{v:+.3f}" for v in shown) + ", ...]"
                     data_text.append(f"{vals_str}\n", style="dim")
+                data_text.append("\n")
             else:
                 data_text.append(f"  {label}\n", style="bright_green")
-                bars = wide_sparkline(vec)
-                data_text.append(f"   {bars}\n", style="green")
-                vals_str = "   [" + ", ".join(f"{v:+.3f}" for v in vec[:4]) + ", ...]"
-                data_text.append(f"{vals_str}\n", style="dim")
-
-            # Arrow between stages
-            if i < len(self._stages) - 1:
-                arrow_style = "green" if i < self._stage_idx else "dim"
-                if label == 'Token Embedding':
-                    data_text.append(f"            +\n", style=arrow_style)
-                else:
-                    data_text.append(f"            \u2193\n", style=arrow_style)
+                bars, _ = wide_sparkline(vec)
+                data_text.append(f"   {bars}", style="green")
+                if i <= last:
+                    data_text.append(connector, style="green")
+                data_text.append("\n\n")
 
         done = self._stage_idx >= len(self._stages)
-        data_text.append(f"\n            \u2193\n", style="green" if done else "dim")
-        data_text.append(f"  Output \u2192 softmax \u2192 pick letter\n", style="green" if done else "dim")
+        if done:
+            probs = self._stages[-1][1]
+            pick_id = probs.index(max(probs))
+            pick_ch = uchars[pick_id] if pick_id != BOS else '\u27E8end\u27E9'
+            pick_pct = probs[pick_id] * 100
+            data_text.append(f"  Output: ", style="dim")
+            data_text.append(f" {pick_ch} ", style="bold reverse bright_green")
+            data_text.append(f" ({pick_pct:.0f}% confidence)\n", style="bright_green")
+        else:
+            data_text.append(f"  Output: ?\n", style="dim")
 
         self._set_pane("#left-pane", data_text,
                        title="Pipeline",
@@ -1406,9 +1436,9 @@ class PredictionScreen(DemoScreen):
         self._on_phase_change()
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Screen 3: Training (auto-start, progress, chart, before/after)
-# ---------------------------------------------------------------------------
+# ---
 class TrainingScreen(DemoScreen):
     SCREEN_INDEX = 4
     max_phase = 3
@@ -1479,23 +1509,28 @@ class TrainingScreen(DemoScreen):
 
         before_panel_text = Text()
         for n in before_names:
-            before_panel_text.append(f"   {n}\n", style="bold red")
-        before_panel_text.append("\n  Gibberish \u2014 no learning yet.\n", style="dim")
+            before_panel_text.append(f" {n[:12]}\n", style="bold red")
 
         after_panel_text = Text()
-        after_panel_text.append("          \u25cc training...\n", style="dim")
+        after_panel_text.append(" \u25cc training...\n", style="dim")
 
-        before_panel = Panel(before_panel_text, title="Before Training",
-                           border_style="red", box=box.ROUNDED, padding=(0, 1))
-        after_panel = Panel(after_panel_text, title="After Training",
-                          border_style="dim", box=box.ROUNDED, padding=(0, 1))
+        before_panel = Panel(before_panel_text, title="Before",
+                           border_style="red", box=box.ROUNDED, padding=(0, 0))
+        after_panel = Panel(after_panel_text, title="After",
+                          border_style="dim", box=box.ROUNDED, padding=(0, 0))
 
-        from rich.console import Group
-        left_content = Group(before_panel, "", after_panel)
-        self._set_pane("#left-pane", left_content, title="Names")
+        grid = Table.grid(expand=True)
+        grid.add_column(ratio=1)
+        grid.add_column(ratio=1)
+        grid.add_row(before_panel, after_panel)
+        self._set_pane("#left-pane", grid, title="Names")
 
+        try:
+            bar_w = max(20, self.query_one("#progress-area", Static).size.width - 30)
+        except Exception:
+            bar_w = 50
         self.query_one("#progress-area", Static).update(
-            f"  {'\u2591' * 50}  0/{NUM_STEPS}   loss: ----"
+            f"  {'\u2591' * bar_w}  0/{NUM_STEPS}   loss: ----"
         )
         self.query_one("#chart-area", Static).update("")
         self._update_status("Training...")
@@ -1509,11 +1544,14 @@ class TrainingScreen(DemoScreen):
         losses = self.app.losses
         elapsed = self.app.train_elapsed
 
-        # Generate "after" names
+        # Generate "after" names (retry if empty)
         self._after_names = []
         for _ in range(3):
-            name, _ = generate_one(sd, uchars, BOS, vocab_size, temp=0.5)
-            self._after_names.append(name.capitalize() if name else "???")
+            for _attempt in range(5):
+                name, _ = generate_one(sd, uchars, BOS, vocab_size, temp=0.5)
+                if name:
+                    break
+            self._after_names.append(name.capitalize() if name else "\u2014")
         self._typing_idx = 0
         self._typing_char_idx = 0
 
@@ -1521,8 +1559,9 @@ class TrainingScreen(DemoScreen):
         text = Text()
         start_loss = losses[0] if losses else 0
         final_loss = losses[-1] if losses else 0
+        actual = getattr(self.app, 'train_steps_done', NUM_STEPS)
         for line in [
-            f"{NUM_STEPS} steps in {elapsed:.1f}s",
+            f"{actual} steps in {elapsed:.1f}s",
             "",
             f"Start loss: {start_loss:.2f}",
             f"Final loss: {final_loss:.2f}",
@@ -1537,9 +1576,16 @@ class TrainingScreen(DemoScreen):
             text.append(line + "\n")
         self._set_pane("#right-pane", text, title="Results", color="green")
 
-        # Final progress bar
+        # Final progress bar (dynamic width)
+        try:
+            bar_w = max(20, self.query_one("#progress-area", Static).size.width - 30)
+        except Exception:
+            bar_w = 50
+        frac = actual / NUM_STEPS
+        filled = int(frac * bar_w)
+        bar = '\u2588' * filled + '\u2591' * (bar_w - filled)
         self.query_one("#progress-area", Static).update(
-            f"  {'\u2588' * 50} {NUM_STEPS}/{NUM_STEPS}  loss: {final_loss:.2f}  \u2713"
+            f"  {bar} {actual}/{NUM_STEPS}  loss: {final_loss:.2f}  \u2713"
         )
         self._update_status(f"\u2713 {elapsed:.1f}s")
         self._training_done = True
@@ -1563,25 +1609,29 @@ class TrainingScreen(DemoScreen):
     def _render_after_panel(self):
         before_panel_text = Text()
         for n in self._before_names:
-            before_panel_text.append(f"   {n}\n", style="bold red")
+            before_panel_text.append(f" {n[:12]}\n", style="bold red")
 
         after_panel_text = Text()
         for i, name in enumerate(self._after_names):
             if i < self._typing_idx:
-                after_panel_text.append(f"   {name}\n", style="green bold")
+                after_panel_text.append(f" {name}\n", style="green bold")
             elif i == self._typing_idx:
                 revealed = name[:self._typing_char_idx]
-                after_panel_text.append(f"   {revealed}", style="green bold")
+                after_panel_text.append(f" {revealed}", style="green bold")
                 after_panel_text.append("\u2588\n", style="bright_green")
             else:
-                after_panel_text.append(f"   \n", style="dim")
+                after_panel_text.append(f" \n", style="dim")
 
-        before_panel = Panel(before_panel_text, title="Before Training",
-                           border_style="red", box=box.ROUNDED, padding=(0, 1))
-        after_panel = Panel(after_panel_text, title=f"After {NUM_STEPS} Steps",
-                          border_style="green", box=box.ROUNDED, padding=(0, 1))
-        from rich.console import Group
-        self._set_pane("#left-pane", Group(before_panel, "", after_panel), title="Names")
+        before_panel = Panel(before_panel_text, title="Before",
+                           border_style="red", box=box.ROUNDED, padding=(0, 0))
+        actual = getattr(self.app, 'train_steps_done', NUM_STEPS)
+        after_panel = Panel(after_panel_text, title=f"After {actual} Steps",
+                          border_style="green", box=box.ROUNDED, padding=(0, 0))
+        grid = Table.grid(expand=True)
+        grid.add_column(ratio=1)
+        grid.add_column(ratio=1)
+        grid.add_row(before_panel, after_panel)
+        self._set_pane("#left-pane", grid, title="Names")
 
     @work(thread=True)
     def _start_training(self):
@@ -1594,22 +1644,29 @@ class TrainingScreen(DemoScreen):
         m_buf, v_buf = app.optimizer
 
         t0 = time.time()
+        actual_steps = 0
         for step in range(NUM_STEPS):
             doc = docs[step % len(docs)]
             loss_val = train_step(step, doc, sd, params, m_buf, v_buf, uchars, BOS)
             app.losses.append(loss_val)
+            actual_steps = step + 1
             self.post_message(TrainProgress(step + 1, loss_val))
             if self._skip_requested:
                 break
         elapsed = time.time() - t0
         app.train_elapsed = elapsed
+        app.train_steps_done = actual_steps
         self.post_message(TrainDone(elapsed))
 
     def on_train_progress(self, msg: TrainProgress):
         step = msg.step
         frac = step / NUM_STEPS
-        filled = int(frac * 50)
-        bar = '\u2588' * filled + '\u2591' * (50 - filled)
+        try:
+            bar_w = max(20, self.query_one("#progress-area", Static).size.width - 30)
+        except Exception:
+            bar_w = 50
+        filled = int(frac * bar_w)
+        bar = '\u2588' * filled + '\u2591' * (bar_w - filled)
         try:
             self.query_one("#progress-area", Static).update(
                 f"  {bar} {step}/{NUM_STEPS}  loss: {msg.loss:.2f}"
@@ -1705,9 +1762,9 @@ class TrainingScreen(DemoScreen):
             self._add_timer(self.set_interval(0.08, self._type_after_names))
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Screen 4: Comparison — Before/After Training Side-by-Side
-# ---------------------------------------------------------------------------
+# ---
 class ComparisonScreen(DemoScreen):
     SCREEN_INDEX = 5
 
@@ -1836,61 +1893,50 @@ class ComparisonScreen(DemoScreen):
         data_text = Text()
 
         # --- BEFORE ---
-        data_text.append(f'  BEFORE Training\n', style="bold red")
-        data_text.append(f'  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n')
+        data_text.append(f'  BEFORE \u2014 next letter after "{ch}":\n\n', style="bold red")
 
-        data_text.append(f'  Next letter after "{ch}":\n\n')
-
-        before_top = sorted(enumerate(before_probs), key=lambda x: -x[1])[:10]
+        before_top = sorted(enumerate(before_probs), key=lambda x: -x[1])[:8]
         before_max = before_top[0][1] if before_top else 1
         for tok_id, prob in before_top:
             lbl = "\u27E8B\u27E9" if tok_id == BOS else f" {uchars[tok_id]} "
-            bar = make_bar(prob * before_p, width=25, max_val=before_max)
+            bar = make_bar(prob * before_p, width=15, max_val=before_max)
             data_text.append(f"  {lbl} ", style="red")
             data_text.append(f"{bar}", style="red")
             if before_p > 0.5:
-                data_text.append(f" {prob*100:5.1f}%\n")
+                data_text.append(f" {prob*100:.1f}%\n")
             else:
                 data_text.append(f"\n")
 
-        ent_bar = make_bar(before_ent / max_ent * before_p, width=15)
-        data_text.append(f"\n  entropy: {before_ent:.1f}/{max_ent:.1f} bits ")
-        data_text.append(f"{ent_bar}", style="red")
-        data_text.append(f'  "random guessing"\n', style="dim")
-
-        data_text.append(f"\n  Names: ", style="dim")
+        data_text.append(f"  entropy: {before_ent:.1f}/{max_ent:.1f} bits ", style="dim")
+        data_text.append(f'"random guessing"\n', style="dim")
         if before_p >= 1.0:
+            data_text.append(f'  "{ch}" names: ', style="dim")
             for n in self._before_names:
                 data_text.append(f"{n}  ", style="bold red")
+            data_text.append("\n")
 
         # --- AFTER ---
-        data_text.append(f'\n\n\n  AFTER {NUM_STEPS} Steps of Training\n', style="bold green")
-        data_text.append(f'  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n')
+        data_text.append(f'\n  AFTER {NUM_STEPS} steps \u2014 next letter after "{ch}":\n\n', style="bold green")
 
-        data_text.append(f'  Next letter after "{ch}":\n\n')
-
-        after_top = sorted(enumerate(after_probs), key=lambda x: -x[1])[:10]
+        after_top = sorted(enumerate(after_probs), key=lambda x: -x[1])[:8]
         after_max = after_top[0][1] if after_top else 1
         for tok_id, prob in after_top:
             lbl = "\u27E8B\u27E9" if tok_id == BOS else f" {uchars[tok_id]} "
-            bar = make_bar(prob * after_p, width=25, max_val=after_max)
+            bar = make_bar(prob * after_p, width=15, max_val=after_max)
             data_text.append(f"  {lbl} ", style="green")
             data_text.append(f"{bar}", style="green")
             if after_p > 0.5:
-                data_text.append(f" {prob*100:5.1f}%\n")
+                data_text.append(f" {prob*100:.1f}%\n")
             else:
                 data_text.append(f"\n")
 
-        ent_bar = make_bar(after_ent / max_ent * after_p, width=15)
-        data_text.append(f"\n  entropy: {after_ent:.1f}/{max_ent:.1f} bits ")
-        data_text.append(f"{ent_bar}", style="green")
-        data_text.append(f'  "has preferences"\n', style="dim")
-
-        data_text.append(f"\n  Names: ", style="dim")
+        data_text.append(f"  entropy: {after_ent:.1f}/{max_ent:.1f} bits ", style="dim")
+        data_text.append(f'"has preferences"\n', style="dim")
         if after_p >= 1.0:
+            data_text.append(f"  Names: ", style="dim")
             for n in self._after_names:
                 data_text.append(f"{n}  ", style="bold green")
-        data_text.append("\n")
+            data_text.append("\n")
 
         self._set_pane("#left-pane", data_text,
                        title=f'Context: "{ch}" \u2014 Before vs After',
@@ -1903,9 +1949,9 @@ class ComparisonScreen(DemoScreen):
         self._start_bar_animation()
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Screen 5: Inference (2 phases) — Animated Table + Temperature Comparison
-# ---------------------------------------------------------------------------
+# ---
 class InferenceScreen(DemoScreen):
     SCREEN_INDEX = 6
     max_phase = 3
@@ -1969,11 +2015,13 @@ class InferenceScreen(DemoScreen):
     def _animate_trained_pipeline(self):
         if self._stage_idx >= len(self._stages):
             self._stop_all_timers()
+            self._render_trained_pipeline()
             self._add_timer(self.set_timer(3.0, self._restart_trained))
             return
-        if self._bar_fill <= N_EMBD:
+        stage_len = len(self._stages[self._stage_idx][1])
+        if self._bar_fill <= stage_len:
             self._render_trained_pipeline()
-            self._bar_fill += 1
+            self._bar_fill += 3
         else:
             self._stage_idx += 1
             self._bar_fill = 0
@@ -1985,55 +2033,76 @@ class InferenceScreen(DemoScreen):
     def _render_trained_pipeline(self):
         data_text = Text()
         ch = self._stage_char
-        data_text.append(f'  Forward pass (trained): "{ch}" at pos {self._stage_pos}\n\n')
+        docs, uchars, BOS, vocab_size = self.app.data
+        data_text.append(f'  Input: "{ch}" at pos {self._stage_pos}\n\n')
 
-        def wide_sparkline(vec, fill=None):
-            if fill is not None:
-                vec = vec[:fill]
+        display_w = N_EMBD
+
+        def wide_sparkline(vec, fill_frac=None):
             if not vec:
-                return ""
-            mn, mx = min(vec), max(vec)
+                return "", 0
+            n = len(vec)
+            bins = []
+            for b in range(display_w):
+                lo = b * n // display_w
+                hi = (b + 1) * n // display_w
+                if hi <= lo:
+                    hi = lo + 1
+                bins.append(sum(vec[lo:hi]) / (hi - lo))
+            mn, mx = min(bins), max(bins)
             if mx == mn:
                 mx = mn + 1
-            return "".join(
+            filled = display_w if fill_frac is None else int(fill_frac * display_w)
+            filled = max(0, min(display_w, filled))
+            chars = "".join(
                 SPARK[min(7, int((v - mn) / (mx - mn) * 7))] * 2
-                for v in vec
+                for v in bins[:filled]
             )
+            padding = "··" * (display_w - filled)
+            return chars + padding, filled
 
+        last = len(self._stages) - 1
         for i, (label, vec) in enumerate(self._stages):
+            n = len(vec)
+            connector = " +" if label == 'Token Embedding' else " \u21b4"
             if i > self._stage_idx:
                 data_text.append(f"  {label}\n", style="dim")
-                data_text.append(f"   {'··' * N_EMBD}\n", style="dim")
+                data_text.append(f"   {'··' * display_w}", style="dim")
+                if i <= last:
+                    data_text.append(connector, style="dim")
+                data_text.append("\n\n")
             elif i == self._stage_idx:
                 data_text.append(f"  {label}\n", style="bold bright_cyan")
-                fill = min(self._bar_fill, len(vec))
-                if fill > 0:
-                    bars = wide_sparkline(vec, fill)
-                    padding = "··" * (N_EMBD - fill)
-                    data_text.append(f"   {bars}{padding}\n", style="bright_cyan")
-                else:
-                    data_text.append(f"   {'··' * N_EMBD}\n", style="dim")
-                shown = vec[:min(4, fill)]
+                fill_frac = self._bar_fill / n if n > 0 else 0
+                bars, filled = wide_sparkline(vec, fill_frac)
+                data_text.append(f"   {bars}", style="bright_cyan")
+                if i <= last:
+                    data_text.append(connector, style="dim")
+                data_text.append("\n")
+                shown = vec[:min(4, self._bar_fill)]
                 if shown:
                     vals_str = "   [" + ", ".join(f"{v:+.3f}" for v in shown) + ", ...]"
                     data_text.append(f"{vals_str}\n", style="dim")
+                data_text.append("\n")
             else:
                 data_text.append(f"  {label}\n", style="bright_green")
-                bars = wide_sparkline(vec)
-                data_text.append(f"   {bars}\n", style="green")
-                vals_str = "   [" + ", ".join(f"{v:+.3f}" for v in vec[:4]) + ", ...]"
-                data_text.append(f"{vals_str}\n", style="dim")
-
-            if i < len(self._stages) - 1:
-                arrow_style = "green" if i < self._stage_idx else "dim"
-                if label == 'Token Embedding':
-                    data_text.append(f"            +\n", style=arrow_style)
-                else:
-                    data_text.append(f"            \u2193\n", style=arrow_style)
+                bars, _ = wide_sparkline(vec)
+                data_text.append(f"   {bars}", style="green")
+                if i <= last:
+                    data_text.append(connector, style="green")
+                data_text.append("\n\n")
 
         done = self._stage_idx >= len(self._stages)
-        data_text.append(f"\n            \u2193\n", style="green" if done else "dim")
-        data_text.append(f"  Output \u2192 softmax \u2192 pick letter\n", style="green" if done else "dim")
+        if done:
+            probs = self._stages[-1][1]
+            pick_id = probs.index(max(probs))
+            pick_ch = uchars[pick_id] if pick_id != BOS else '\u27E8end\u27E9'
+            pick_pct = probs[pick_id] * 100
+            data_text.append(f"  Output: ", style="dim")
+            data_text.append(f" {pick_ch} ", style="bold reverse bright_green")
+            data_text.append(f" ({pick_pct:.0f}% confidence)\n", style="bright_green")
+        else:
+            data_text.append(f"  Output: ?\n", style="dim")
 
         self._set_pane("#left-pane", data_text,
                        title="Pipeline (Trained)",
@@ -2296,9 +2365,9 @@ class InferenceScreen(DemoScreen):
         self._on_phase_change()
 
 
-# ---------------------------------------------------------------------------
+# ---
 # Screen 5: Closing — Auto-Scrolling Source + Scale Comparison
-# ---------------------------------------------------------------------------
+# ---
 class ClosingScreen(DemoScreen):
     SCREEN_INDEX = 7
     SCREEN_TITLE = "Summary"
@@ -2320,10 +2389,14 @@ class ClosingScreen(DemoScreen):
         except Exception:
             source = "# Could not read source file"
 
-        marker = "# TUI"
-        idx = source.find(marker)
-        if idx > 0:
-            engine_source = source[:idx].rstrip()
+        start_marker = "# microGPT"
+        end_marker = "# TUI"
+        start_idx = source.find(start_marker)
+        end_idx = source.find(end_marker)
+        if start_idx >= 0 and end_idx > start_idx:
+            engine_source = source[start_idx:end_idx].rstrip()
+        elif end_idx > 0:
+            engine_source = source[:end_idx].rstrip()
         else:
             engine_source = source[:3000]
 
@@ -2363,7 +2436,7 @@ class ClosingScreen(DemoScreen):
 
         syntax = Syntax(window_text, "python", theme="monokai",
                        line_numbers=True, start_line=offset + 1,
-                       word_wrap=False)
+                       word_wrap=True)
 
         # Scroll position indicator
         total = len(lines)
@@ -2438,9 +2511,9 @@ class ClosingScreen(DemoScreen):
         return "Step 6/6                          j/k speed \u00b7 Space pause     ? help  q quit"
 
 
-# ---------------------------------------------------------------------------
+# ---
 # App
-# ---------------------------------------------------------------------------
+# ---
 class MicroGPTApp(App):
     CSS = APP_CSS
     TITLE = "microGPT"
